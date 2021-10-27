@@ -1,0 +1,2426 @@
+--- 
+title: "All"
+author: "Chase Clark"
+output: 
+  html_document:
+      self_contained: yes
+params:
+  conditions:  "all"
+---
+
+```{r}
+conditions <- params$conditions
+```
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  cache = FALSE,
+  python.reticulate = FALSE
+)
+```
+
+```{r remove-old-files, eval=TRUE, include=FALSE}
+# remove any files from previous runs
+files_to_remove <- list.files(here::here("data",
+                                         "mans"),full.names = T)
+file.remove(list.files(files_to_remove, full.names=TRUE, recursive =T))
+```
+
+
+
+```{r load-packages}
+library(IDBacApp)
+library(dplyr)
+library(data.table)
+library(ggplot2)
+library(here)
+library(dendextend)
+library(ggtree)
+library(ggpubr)
+library(GGally)
+library(plotly)
+library(vegan)
+library(ggdendro)
+library(ggbeeswarm)
+library(readr)
+library(patchwork)
+```
+
+```{r define-color-palette}
+color_pal <- list(scd18="#1b9e77", scd21="#7570b3")
+```
+
+```{r load_functions}
+
+source(here::here("R",
+                  "bob.R"))
+source(here::here("R",
+                  "cut_analysis.R"))
+source(here::here("R",
+                  "b_div_plot.R"))
+source(here::here("R",
+                  "maldiBLAST.R"))
+source(here::here("R",
+                  "sm_pcoa.R"))
+source(here::here("R",
+                  "recolor_mans.R"))
+```
+
+```{r set-seed}
+set.seed(42)
+```
+
+```{r connect_to_sponge_idbac_database, cache=FALSE}
+pool <- IDBacApp::idbac_connect(fileName = "two_sponge",
+                                filePath = here::here("data",
+                                                      "sqlite"))[[1]]
+```
+
+```{r get-reduced-sample-list}
+# The purpose of this code chunk is to find paired samples across the the two sponges
+# based on the "conditions" variable set at the top of the document
+# e.g. if "conditions <- c("heat_treatment","media" "dilution") then the only isolates that
+# for which identical "heat_treatment" And "media" are present for both sponges
+# this is to ensure better balanced comparison of isolates between sponges
+if (conditions == "all") {
+  # collect all sample ids
+  meta <- tbl(pool, "metadata") %>% collect()
+  sample_ids <- meta$strain_id
+} else if (conditions == "matched") {
+  # Get metadata for all isolates
+  
+  meta <- tbl(pool, "metadata") %>% collect()
+  meta <- as.data.table(meta)
+  # Make a combined column that is all conditions, concatenated; leave out sponge column
+  meta[ ,
+        metadata_combined := .(col_test = do.call(paste, c(.SD, sep="_"))),
+        .SDcols =  c("media","heat_shock")]
+  
+  # Get how many times a condition occurs (once per sponge)
+  # So, if condition in both, value is two, else 1
+  # filter for occurrence in both sponges(2)
+  for_filter <- meta[ , 
+                      length(unique(sponge_identifier)) == 2,
+                      metadata_combined][V1 == TRUE, ]$metadata_combined
+  # filter the metadata table
+  meta <- meta[metadata_combined %in% for_filter, ]
+  # ids of isolates that have matching isolation conditions in both sponges
+  sample_ids <- meta$strain_id
+}
+```
+
+```{r create-man-directories}
+dir.create(here::here("data/mans/py_mans/json"), recursive = T)
+dir.create(here::here("data/mans/raw_tsv"), recursive = T)
+dir.create(here::here("manuscript/figures", conditions), recursive = T)
+```
+
+```{r}
+cat("Number of isolates:", length(sample_ids))
+```
+
+```{r protein_peak_processing}
+# Retrieve peak data
+protein_peak_data <- IDBacApp::idbac_get_peaks(pool = pool,
+                                               sampleIDs = NULL,
+                                               minFrequency = 0.7,
+                                               minNumber = 1,
+                                               lowerMassCutoff = 4000L,
+                                               upperMassCutoff = 15000L,
+                                               minSNR = 6,
+                                               tolerance = 2,
+                                               type = "protein",
+                                               mergeReplicates = TRUE,
+                                               method = "strict")
+
+# Represent peaks as probability distributions on a higher dimensional vector (alternative to binning)
+protein_peak_matrix <- IDBacApp::createFuzzyVector(massStart = 4000L,
+                                                   massEnd = 15000L,
+                                                   massList = lapply(protein_peak_data, function(x) x@mass),
+                                                   intensityList = lapply(protein_peak_data, function(x) x@intensity),
+                                                   ppm = 3000L)
+# Basically turn normal distributions of peak representation to presence/absence
+# This means we're euqally-weighting variable regions around each peak that vary in width based on ppm
+protein_peak_matrix[protein_peak_matrix > 0] <- 1
+
+# Calculate distance matrix and dendrogram
+protein_peak_dend <- IDBacApp::idbac_dendrogram_creator(bootstraps = 0L,
+                                                        distanceMethod = 'cosine',
+                                                        clusteringMethod = 'ward.D2',
+                                                        proteinMatrix = protein_peak_matrix)
+
+
+remove(protein_peak_data, protein_peak_matrix)
+```
+
+```{r search-maldi-ref-database}
+# Connect to IDBac database with strains previously identified via 16S-rRNA sequencing analysis
+ref_pool <- IDBacApp::idbac_connect(fileName = "reference",
+                                    filePath = here::here("data/ref_db/sqlite"))[[1]]
+
+# Search sponge strains against reference IDBac database
+# 0.63 was found empirically but subjectively. However, 
+# though preprocessing was different, it is similar to the 
+# 0.65 value found to represent actual OTUs in DOI:10.7717/peerj.11359
+
+search_result <- maldiBLAST(queryPool = pool,
+                            subjectPool = ref_pool,
+                            searchThreshold = 0.63)
+
+# maldiBLAST returns ids of matches from both databases
+# here we connect ids to 16S genus metadata
+genus <- IDBacApp::idbac_get_metadata(strainID = search_result$subject,
+                                      metadataColumn = "genus",
+                                      pool = ref_pool)
+
+# combine search results and genus information
+search_result <- cbind(search_result,
+                       genus = genus$genus)
+search_result
+
+```
+
+The identified Bacillus isolates are marked by red points, the boundaries are denoted by blue points
+```{r dend-boundaries}
+# Start and stop positions of different groups on the dendrogram
+# (Manually determined from the tree that includes all isolates)
+# Here we take these dendrogram label indices and find the sample ids contained in each group
+# so we can collapse groups when the dataset is reduced/tree is pruned
+genera_boundaries <- list(
+  Chryseobacterium = c(1, 220),
+  Delftia = c(221, 384),
+  Streptomyces = c(817, 824),
+  Pseudomonas = c(551, 623),
+  Micromonospora = c(624, 684),
+  Bacillus1 = c(721, 760), 
+  Bacillus2 = c(761, 816), 
+  Bacillus = c(721, 816),
+  Yersinia = c(385, 417)
+)
+
+# The reason there are two groups of Bacillus is because there is a third cluster of isolates (including Streptomyces and Paenibacillus) that are within the lame "LCA" node which is required by the plotting package for the dendrogram. After plotting the dendrogram we remove "Bacillus1" and "Bacillus2", leaving the contiguous "Bacillus"
+
+
+# e.g. manual inspection
+plot(protein_peak_dend$dendrogram, xlim=c(720, 850)); points(which(labels(protein_peak_dend$dendrogram) %in% search_result[genus=="Bacillus"]$query), rep(1, length(which(labels(protein_peak_dend$dendrogram) %in% search_result[genus=="Bacillus"]$query))), col='red', pch=19, cex=1); points(c(721, 760, 761, 816), rep(0, 4) ,col='blue', pch=19, cex=0.8)
+```
+
+
+```{r}
+# So, this will be a list of ids, named as above
+genera_boundaries_ids <- lapply(genera_boundaries, 
+                                function(x){
+                                  x <- seq(x[[1]], 
+                                           x[[2]])
+                                  labels(protein_peak_dend$dendrogram)[x]
+                                })
+```
+
+```{r prune-dendrogram}
+# Remove non-matching samples from distance matrix
+protein_peak_dend$distance <- as.matrix(protein_peak_dend$distance)
+# sanity check
+if(!identical(colnames(protein_peak_dend$distance), rownames(protein_peak_dend$distance))) stop()
+temp <- which(colnames(protein_peak_dend$distance) %in% sample_ids)
+protein_peak_dend$distance <- protein_peak_dend$distance[temp, temp]
+remove(temp)
+
+# Remove non-matching sample from dendrogram
+protein_peak_dend$dendrogram <- dendextend::prune(protein_peak_dend$dendrogram,
+                                                  labels(protein_peak_dend$dendrogram)[!labels(protein_peak_dend$dendrogram) %in% sample_ids])
+```
+
+```{r re-find-genera-boundaries}
+# a couple chunks above. This is here to assign groups for the 
+# pruned datasets/trees
+
+# So, this will be a list of ids, named as above
+
+genera_boundaries <- lapply(genera_boundaries_ids, 
+                            function(x){
+                              x <- which(labels(protein_peak_dend$dendrogram ) %in% x)
+                              
+                              return(c(head(x, 1), 
+                                       tail(x, 1)))
+                            })
+
+# Get ids within boundaries of current dataset, not full-sample-dataset
+genera_boundaries_ids <- lapply(genera_boundaries, 
+                                function(x){
+                                  x <- seq(x[[1]], 
+                                           x[[2]])
+                                  labels(protein_peak_dend$dendrogram)[x]
+                                })
+```
+
+```{r figure-1-dendrogram, fig.height=10, fig.width=7}
+# Pseudo-phylogenetic clustering of MALDI-TOF MS protein spectra with IDBac reveals closely related species 
+# and the impact of isolation conditions.** Hierarchical clustering of MALDI-TOF MS protein spectra groups 
+# bacterial isolates to the genus/species level. Isolates identified using 16S-rRNA sequencing were plotted 
+# besides the dendrogram and isolates identified with MALDI-TOF MS are indicated with an asterisk. The 
+# scatter plot displays isolation conditions for each isolate, colored by the originating sponge.
+
+# loop through and retrieve associations of dendrogram labels and metadata
+dendrogram_ordered_metadata <- lapply(c("heat_shock", "dilution", "media"),
+                                      function(x){
+                                        met <- IDBacApp::idbac_get_metadata(strainID = labels(protein_peak_dend$dendrogram),
+                                                                            metadataColumn = x,
+                                                                            pool = pool)[, 2]
+                                        
+                                        met2 <- IDBacApp::idbac_get_metadata(strainID = labels(protein_peak_dend$dendrogram),
+                                                                             metadataColumn = "sponge_identifier",
+                                                                             pool = pool)[, 2]
+                                        
+                                        data.table::data.table(n = seq_along(labels(protein_peak_dend$dendrogram)),
+                                                               metadata = met,
+                                                               metadata_id = x,
+                                                               sponge = met2)
+                                      })
+
+# collapse list into one data.table
+dendrogram_ordered_metadata <- do.call(rbind, dendrogram_ordered_metadata)
+
+# Change "no dilution" values to zero without copy on modify
+dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "ND", metadata := "0" ]
+
+# Change dilutions to fraction string
+dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "100", metadata := "1/100" ]
+dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "10", metadata := "1/10" ]
+
+# Order factors for ggplot
+ord <- c("FALSE",
+         "TRUE",
+         "0",
+         "1/10",
+         "1/100",
+         "MAC",
+         "ISP1",
+         "LB",
+         "LWA",
+         "ISP2",
+         "A1F",
+         "CGSF",
+         "CHITIN",
+         "NZSGF")
+
+# make metadata column a factor for ggplot, with specfied order
+dendrogram_ordered_metadata[ , metadata := factor(metadata, levels = ord) ]
+
+# make facets a factor
+dendrogram_ordered_metadata[ , metadata_id := factor(metadata_id) ]
+
+# Check facet factor levels
+temp <- levels(dendrogram_ordered_metadata$metadata_id)
+if(!identical(temp, c("dilution", "heat_shock",  "media"))) stop()
+
+# make better strings for facet labels
+levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "dilution"] <- "Dilution"
+levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "heat_shock"] <- "Heat Treatment"
+levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "media"] <- "Media"
+
+# setup data frame for creatig separating lines in ggplot
+factor_plot_lines <- data.frame(yo = c(rep("Dilution", 2),
+                                       rep("Heat Treatment", 1),
+                                       rep("Media", 8)),
+                                val = c(1:2 + .5,
+                                        1 + .5,
+                                        1:8 + .5))
+```
+
+```{r plot-dendrogram}
+# ggplot metadata scatterplot portion
+p1 <- ggplot(dendrogram_ordered_metadata) +
+  geom_jitter(aes(y = (n),
+                  x = as.factor(metadata),
+                  color = sponge),
+              height = 0,
+              width = 0.2,
+              alpha = 0.6) +
+  scale_color_manual(values = c("#1b9e77",
+                                "#7570b3")) +
+  facet_wrap(~metadata_id,
+             ncol = 3,
+             scales = "free_x") +
+  cowplot::theme_cowplot(font_size = 8) +
+  cowplot::panel_border() +
+  theme(axis.title.y = element_blank(),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(angle = 90,
+                                   hjust = 0.9,
+                                   vjust = 0.6,
+                                   size = 7),
+        legend.title.align = 0.5) +
+  geom_vline(data = factor_plot_lines,
+             aes(xintercept = val),
+             lwd = 0.25,
+             colour = "grey",
+             lty = 2) +
+  labs(color = "Sponge") +
+  scale_y_continuous(limits = c(0,length(labels(protein_peak_dend$dendrogram))),
+                     expand = c(0, 0))
+
+
+# ggplot dendrogram portion
+p2 <- ggtree(ape::as.phylo(protein_peak_dend$dendrogram),
+             ladderize = FALSE)
+
+
+
+# Auto-annotate genera onto dendrogram
+
+# get 16s genus information
+genera_16s <- IDBacApp::idbac_get_metadata(strainID = labels(protein_peak_dend$dendrogram),
+                                           metadataColumn = "genus",
+                                           pool = pool)[, 2]
+
+# combine 16s genera data with MALDI-TOF reference db matches
+genera_maldi <- search_result$genus[match(labels(protein_peak_dend$dendrogram),
+                                          search_result$query)]
+genera_maldi[is.na(genera_maldi)] <- ""
+genera <- genera_16s
+genera[is.na(genera)] <- ""
+genera <- paste0(genera, genera_maldi)
+
+
+# Add genera labels to plot
+
+g <- cbind.data.frame(x = rep(0, length(genera)),
+                      y = 1:length(genera),
+                      tex = genera,
+                      stringsAsFactors = FALSE)
+
+# collapse select branches of dendrogram
+ggplot_dend <-  p2 + 
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Chryseobacterium, 1),
+                              tail(genera_boundaries_ids$Chryseobacterium, 1)),
+                  label = 'paste(italic("Chryseobacterium"))',
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) +
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Delftia, 1),
+                              tail(genera_boundaries_ids$Delftia, 1)),
+                  label = 'paste(italic("Delftia"))',
+                  align = TRUE, 
+                  offset = .3, 
+                  fontsize = 3, 
+                  offset.text = .1,
+                  parse = TRUE) +
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Pseudomonas, 1),
+                              tail(genera_boundaries_ids$Pseudomonas, 1)),
+                  label = 'paste(italic("Pseudomonas"))',
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .3, 
+                  offset.text = .1,
+                  parse = TRUE) +
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Micromonospora, 1),
+                              tail(genera_boundaries_ids$Micromonospora, 1)),
+                  label = 'paste(italic("Micromonospora"))',
+                  align = TRUE, 
+                  offset = .2, 
+                  fontsize = 3, 
+                  offset.text = .1,
+                  parse = TRUE) +
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Bacillus1, 1),
+                              tail(genera_boundaries_ids$Bacillus1, 1)),
+                  label = 'paste(italic("Bacillus"))',
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) +
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Bacillus2, 1),
+                              tail(genera_boundaries_ids$Bacillus2, 1)),
+                  label = 'paste(italic("Bacillus"))',
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) +
+    geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              head(genera_boundaries_ids$Yersinia, 1),
+                              tail(genera_boundaries_ids$Yersinia, 1)),
+                  label = 'paste(italic("Yersinia"))',
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) +
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              labels(protein_peak_dend$dendrogram)[[grep("Streptomyces", g$tex)[[1]]]]), # only one Strept ID actually exists
+                  label = 'paste(italic("Streptomyces"))',
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) + 
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              labels(protein_peak_dend$dendrogram)[[grep("Paenibacillus", g$tex)[[1]]]]),
+                  label = 'paste(italic("Paenibacillus"))',# two Paen, only select one because they overlap each other 
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) + 
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              labels(protein_peak_dend$dendrogram)[[tail(grep("Yersinia", g$tex), 1)]]),
+                  label = 'paste(italic("Yersinia"))',# this adds the lonely Yersinia
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  offset.text = .1,
+                  parse = TRUE) + 
+  geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                              labels(protein_peak_dend$dendrogram)[[tail(grep("Enterobacter", g$tex), 1)]]),
+                  label = 'paste(italic("Enterobacter"))',# this adds the lonely Yersinia
+                  align = TRUE, 
+                  fontsize = 3,
+                  offset = .2, 
+                  parse = TRUE)
+
+if (conditions == "all"){
+  ggplot_dend <-  ggplot_dend + 
+    geom_cladelabel(node = MRCA(ape::as.phylo(protein_peak_dend$dendrogram),
+                                labels(protein_peak_dend$dendrogram)[[grep("Rahnella", g$tex)[[1]]]]),
+                    label = 'paste(italic("Rahnella"))',
+                    align = TRUE, 
+                    fontsize = 3,
+                    offset = .2, 
+                    offset.text = .1,
+                    parse = TRUE) 
+}
+
+
+  ggplot_dend + 
+  xlim(NA, 8.2) +
+  p1 +
+  plot_layout(ncol = 2,
+              widths = c(1, 1)) +
+  theme(plot.margin = unit(c(0,0,0,0), "cm")) -> ggplot_dend
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-dend-all.pdf"),
+       plot = ggplot_dend,
+       device = "pdf",
+       width = 175,
+       height = 240,
+       units = "mm")
+ggplot_dend
+```
+
+```{r}
+remove(
+  "dendrogram_ordered_metadata",
+  "factor_plot_lines",
+  "genera",
+  "genera_16s",
+  "genera_maldi",
+  "genus",
+  "ord",
+  "ggplot_dend",
+  "p1",
+  "p2",
+  "temp",
+  "ref_pool"
+)
+
+# The reason there are two groups of Bacillus is because there is a third cluster of isolates (including Streptomyces and Paenibacillus) that are within the lame "LCA" node which is required by the plotting package for the dendrogram. After plotting the dendrogram we remove "Bacillus1" and "Bacillus2", leaving the contiguous "Bacillus"
+
+genera_boundaries['Bacillus1']=NULL
+genera_boundaries['Bacillus2']=NULL
+
+```
+
+
+
+
+```{r figure-2-dendrogram-cut}
+
+# Cluster analysis shows overlap between sponges for a quarter to half of isolates with similar protein spectra.
+# Hierarchical clustering of MALDI-TOF MS protein spectra was used to determine the overlap of isolates between sponges (a).
+# By “cutting” the dendrogram at intervals of 0.05, we determined the fraction of groups that contained isolates
+# from SCD18, SCD21, or both (b). Because the number of groups decreases dramatically as the dendrogram cut height
+# increases (b) we also evaluated raw isolate counts within groups for every cut (c).
+
+# get all sample ids
+sample_meta <- IDBacApp::idbac_get_metadata(strainID = labels(protein_peak_dend$dendrogram),
+                                            metadataColumn = "sponge_identifier",
+                                            pool = pool)
+sample_meta <- as.data.table(sample_meta)
+
+# define intervals of where to cut dendrogram
+break_interval <- .05
+seq_cuts <- seq(from = 0,
+                to = 8,
+                by = break_interval)
+
+# Analyze group content by cutting protein spectra dendrogram at all 'seq_cuts'
+cont <- lapply(seq_cuts, 
+               function(x) {
+                 # cut dendrogram
+                 # This creates a named integer vector, names are dendrogram labels
+                 # integers represent the created groups
+                 z <- cutree(protein_peak_dend$dendrogram, h = x)
+                 
+                 # change names to which sponge an isolate came from
+                 names(z) <- sample_meta[match(names(z), strain_id)]$sponge_identifier
+                 
+                 # turn named int vector into list, where elements are groups created by cutree()
+                 z <- split(names(z), as.numeric(z))
+                 
+                 # loop over groups
+                 z <- lapply(seq_along(z),  
+                             function(x){
+                               
+                               if(length(z[[x]]) > 1) {
+                                 # If more than one orgin sponge, combine into length=1 char vector
+                                 y <- paste0(sort(unique(z[[x]])), collapse = ", ")
+                               } else {
+                                 # If only one sponge, return it as length=1 char vector
+                                 y <- z[[x]]
+                               }
+                               # create a data table from the results
+                               data.table::data.table(group = x, 
+                                                      contents = y, 
+                                                      members = length(z[[x]]),
+                                                      stringsAsFactors = F)
+                             })
+                 # combine data tables for all groups
+                 z <- do.call(rbind, z)
+                 # add the cut height to the table
+                 cbind(cut_height = x, z)
+               })
+
+# combine all cut analyses
+cont <- do.call(rbind, cont)
+
+# convert group content to factor for ggplot
+cont$contents <- factor(cont$contents,
+                        levels = c(
+                          "SCD18",
+                          "SCD21",
+                          "SCD18, SCD21"))
+
+# create group fraction analysis plot
+idbac_cut_plot <- ggplot() + 
+  geom_bar(data = cont[cut_height %in% seq_cuts, ], 
+           aes(
+             x = cut_height,
+             fill = contents),
+           position="fill", 
+           stat="count",
+           width = break_interval) +
+  labs(fill = "Source Sponge",
+       x = "Dendrogram Cut Height",
+       y = "Fraction of Groups",
+       title  =  "") + 
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values=c("#1b9e77",
+                             "#7570b3",
+                             "#d95f02")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        strip.background.x = element_rect(color = NA,
+                                          fill = NA))
+
+
+# count how many isolates at each cut belong to a group...
+# that contains isolates from one sponge, the other sponge, or both
+temp <- cont[, list(SCD18=sum(.SD[contents == "SCD18"]$members),
+                    SCD21=sum(.SD[contents == "SCD21"]$members),
+                    Both=sum(.SD[contents == "SCD18, SCD21"]$members)), cut_height]
+
+temp <- melt(temp, 
+             id.vars="cut_height",
+             measure.vars = c("SCD18",
+                              "SCD21", 
+                              "Both"))
+# remove 0's to prevent confusing overplotting 
+# doesn't effect interpretation of plot
+temp <- temp[value > 0, ]
+
+idbac_cut_plot2 <- ggplot(temp) + 
+  geom_point(aes(x = cut_height,
+                 y = value,
+                 color = variable),
+             alpha = 0.7) +
+  scale_color_manual(name = "Source Sponge",
+                     values = c("#1b9e77",
+                                "#7570b3",
+                                "#d95f02")) +
+  cowplot::theme_cowplot(font_size = 10) +
+  labs(y= "Isolate Count", x = "Dendrogram Cut Height") 
+
+
+# plot flipped dendrogram with example cut
+dend <- ggdendro::ggdendrogram(protein_peak_dend$dendrogram, 
+                               rotate = TRUE, 
+                               leaf_labels = F,
+                               labels = FALSE) + 
+  theme(axis.text.y = element_blank(),
+        axis.text.x = element_text(hjust = 0.5, 
+                                   vjust = 5)) + 
+  scale_y_continuous(limits = c(0, 9), 
+                     breaks = 0:9) + 
+  geom_hline(aes(yintercept = 2),
+             linetype = "dashed",
+             color = "red") + 
+  annotate("text", 
+           x = length(labels(protein_peak_dend$dendrogram)) - 50, 
+           y = 4.5,
+           label = 'Cut height of 2',
+           size = 2.5,
+           color = "red")
+
+# combine plots into final figure
+p <- ggpubr::ggarrange(dend, 
+                       ggpubr::ggarrange(idbac_cut_plot +
+                                           theme(legend.position = "none",
+                                                 axis.title.x = element_blank()),
+                                         idbac_cut_plot2 + 
+                                           theme(legend.position = c(0.7, 0.5)),
+                                         ncol = 1,
+                                         nrow = 2,
+                                         common.legend = FALSE,
+                                         labels= c("b", "c")),
+                       ncol = 2,
+                       widths = c(1, 2), 
+                       labels = c("a", ""))
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-gr-analysis.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+p
+```
+
+```{r}
+remove(
+  "break_interval",
+  "cont",
+  "dend",
+  "idbacfuzzifier_plot",
+  "idbacfuzzifier_plot2",
+  "sample_meta",
+  "seq_cuts",
+  "temp"
+)
+```
+
+
+```{r read-and-process-sm-peak-data}
+# get small molecule spectra fro all samples
+small_peak_data <- IDBacApp::idbac_get_peaks(pool = pool,
+                                             sampleIDs = labels(protein_peak_dend$dendrogram),
+                                             minNumber = 1,
+                                             minFrequency = 0.7,
+                                             lowerMassCutoff = 200L,
+                                             upperMassCutoff = 2000L,
+                                             minSNR = 6,
+                                             tolerance = 0.002,
+                                             type = 'small')
+
+# bin using MALDIquant
+small_peak_matrix <- IDBacApp::mquant_bin(massStart = 200,
+                                          massEnd = 2000,
+                                          massList = lapply(small_peak_data, function(x) x@mass),
+                                          intensityList = lapply(small_peak_data, function(x) x@intensity),
+                                          method = 'strict',
+                                          tolerance = .002)
+
+small_peak_matrix[small_peak_matrix > 0] <- 1
+
+```
+
+
+```{r intra-genus-protein-sm-correlation}
+small_dist <- coop::cosine(small_peak_matrix)
+protein_dist <- protein_peak_dend$distance
+
+protein_dist <- as.matrix(protein_dist)
+protein_dist <- 1 - protein_dist
+
+
+
+awsd <- function(small_dist, 
+                 protein_dist, 
+                 genera_var){
+  
+  # Probably could just do this on the dist matrix but to be safe
+  # we'll get the ids and match 
+  ext_labs <- labels(protein_peak_dend$dendrogram)
+  # Extracted isolate ids
+  ext_labs <- ext_labs[genera_boundaries[[genera_var]][[1]]:genera_boundaries[[genera_var]][[2]]]
+  
+  ind <- match(ext_labs, colnames(protein_dist))
+  p_dist <- protein_dist[ind, ind]
+  ind <- match(ext_labs, colnames(small_dist))
+  s_dist <- small_dist[ind, ind]
+  
+  if(!identical(colnames(p_dist),colnames(s_dist))) stop()
+  if(length(colnames(p_dist)) != length(ext_labs)) stop()
+  
+  
+  ext_protein <- p_dist[lower.tri(p_dist, diag = F)]
+  ext_sm <- s_dist[lower.tri(s_dist, diag = F)]
+  
+  ext <- cbind.data.frame(protein = ext_protein,
+                          sm = ext_sm, 
+                          genera_var)
+}
+
+
+
+p <- lapply(names(genera_boundaries), 
+            function(x){
+              awsd(small_dist = small_dist, protein_dist = protein_dist, genera_var = x)
+            })
+
+p <- do.call(rbind, p)
+
+p <- ggplot(p, aes(x = sm, y = protein)) + 
+  geom_point(alpha = 0.3) +
+  stat_cor(method = "pearson",
+           r.accuracy = 0.01,
+           p.accuracy = 0.01,
+           label.x = 0.1,
+           label.y = 0.0) + 
+  geom_smooth(method = "lm") + 
+  coord_cartesian(xlim = c(0, 1),
+                  ylim = c(0, 1)) + 
+  xlab("Small Molecule Spectrum Similarity") + 
+  ylab("Protein Spectrum Similarity") +
+  facet_wrap(~genera_var) + 
+  theme(strip.text = element_text(face = "italic"))
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-fig-genus-corr.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+p
+```
+
+```{r boxplot-compare-protein-sm}
+
+small_dist <- coop::cosine(small_peak_matrix)
+protein_dist <- protein_peak_dend$distance
+
+protein_dist <- as.matrix(protein_dist)
+protein_dist <- 1 - protein_dist
+protein_cut_analysis <- cut_analysis(input_dist = protein_dist,
+                                     input_dend = protein_peak_dend$dendrogram, 
+                                     start_seq = 0,
+                                     stop_seq = 3,
+                                     by_seq = 0.1)
+
+
+sm_cut_analysis <- cut_analysis(input_dist = small_dist,
+                                input_dend = protein_peak_dend$dendrogram, 
+                                start_seq = 0,
+                                stop_seq = 3,
+                                by_seq = 0.1)
+
+#convert distance to similarity
+
+prot_gg <- ggplot(protein_cut_analysis[ , list(mixed = sum(mixed) > 0, 
+                                               value = mean(value),
+                                               count = .N),
+                                        list(group, iter)][value < 1]) + 
+  geom_boxplot(aes(x = as.factor(iter),
+                   y = value)) +
+  ggbeeswarm::geom_quasirandom(aes(x = as.factor(iter),
+                                   y = value),
+                               alpha = 0.5) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "",
+       y = "Protein spectrum cosine similarity",
+       title = "Protein spectrum similarity decreases at higher protein dendrogram cut heights") + 
+  theme_minimal()
+
+
+
+
+sm_gg <- ggplot(sm_cut_analysis[ , list(mixed = sum(mixed) > 0, 
+                                        value = mean(value),
+                                        count = .N),
+                                 list(group, iter)][value < 1]) + 
+  geom_boxplot(aes(x = as.factor(iter),
+                   y = value)) +
+  ggbeeswarm::geom_quasirandom(aes(x = as.factor(iter),
+                                   y = value),
+                               alpha = 0.5) +
+  coord_cartesian(ylim = c(0, 1)) +
+  labs(x = "Protein Dendrogram Cut Height",
+       y = "SM spectrum cosine similarity",
+       title = "SM spectrum similarity decreases at higher protein dendrogram cut heights") + 
+  theme_minimal()
+
+p <- ggpubr::ggarrange(prot_gg,
+                       sm_gg,
+                       ncol = 1,
+                       nrow = 2,
+                       common.legend = TRUE,
+                       legend = "right")
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-supp-cor1.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+
+p
+
+remove(
+  "protein_cut_analysis", 
+  "sm_cut_analysis"
+)
+```
+
+```{r smallmol-vs-protein-all-vs-all, fig.height=6, fig.width=8}
+
+small_peak_matrix <- IDBacApp::createFuzzyVector(massStart = 200,
+                                                 massEnd = 2000,
+                                                 massList = lapply(small_peak_data, function(x) x@mass),
+                                                 intensityList = lapply(small_peak_data, function(x) x@intensity),
+                                                 ppm = 300)
+
+# Basically turn normal distributions of peak representation to presence/absence
+# This means we're euqally-weighting variable regions around each peak that varies based on ppm
+small_peak_matrix[small_peak_matrix > 0] <- 1
+
+# Calculate distance matrix and dendrogram
+small_peak_dend <- IDBacApp::idbac_dendrogram_creator(
+  bootstraps = 0L,
+  distanceMethod = 'cosine',
+  clusteringMethod = 'ward.D2',
+  proteinMatrix = small_peak_matrix # this is correct, because we want sm distances
+)
+
+
+a <- reshape2::melt(as.matrix(protein_peak_dend$distance))
+b <- reshape2::melt(as.matrix(small_peak_dend$distance))
+if (!identical(as.character(a[, 1:2]), as.character(b[, 1:2]))) stop()
+
+combined <- cbind(a, b[, 3])
+remove(a, b)
+colnames(combined) <- c("Var1", "Var2", "prot_dist", "sm_dist")
+combined <- as.data.table(combined)
+
+# Invert so 0=least similar and 1=most similar
+combined$prot_dist <- 1 - combined$prot_dist
+combined$sm_dist <- 1 - combined$sm_dist
+
+
+p <- ggplot(combined,
+            aes(x=`sm_dist`,
+                y=`prot_dist`) ) +
+  geom_bin2d(bins = 200) +
+  geom_smooth() +
+  scale_fill_continuous(type = "viridis") +
+  theme_bw() + 
+  ylab("Protein Spectrum Similarity") +
+  xlab("Small Spectrum Fingerprint Similarity") + 
+  annotate("text", 
+           x = .95, 
+           y = 1,
+           label = 'Most similar',
+           size = 3,
+           color = "red") +
+  annotate("text", 
+           x = .05, 
+           y = -.03,
+           label = 'Most dissimilar',
+           size = 2.75,
+           color = "red") + 
+  coord_cartesian(ylim=c(0, 1))
+
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-supp-cor2.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+
+p
+remove("small_peak_matrix")
+```
+
+```{r get-small-peak-data}
+small_peak_data <- IDBacApp::idbac_get_peaks(pool = pool,
+                                             sampleIDs = NULL,
+                                             minNumber = 2,
+                                             minFrequency = 0,
+                                             lowerMassCutoff = 200L,
+                                             upperMassCutoff = 2000L,
+                                             minSNR = 6,
+                                             tolerance = 0.002,
+                                             type = 'small')
+```
+
+```{r tsv-paths}
+
+tsv_path <- paste0(conditions, 
+                   collapse = "_")
+
+tsv_path <- file.path("data/mans/raw_tsv",
+                      tsv_path)
+
+dir.create(here::here(tsv_path))
+
+```
+
+```{r generate-mans, message=FALSE, warning=FALSE}
+
+
+
+for(i in seq_along(genera_boundaries)) {
+  
+  smaller <- names(small_peak_data)
+  
+  ids <- labels(protein_peak_dend$dendrogram)[genera_boundaries[[i]][1]:genera_boundaries[[i]][2]]
+  
+  smaller <- small_peak_data[match(ids, smaller)]
+  
+  smaller <- MALDIquant::binPeaks(l = smaller,
+                                  method = 'strict', 
+                                  tolerance = .002)
+  
+  smaller <- IDBacApp:::small_maldiquant_to_network(peakList = smaller,
+                                                    sampleIDs = labels(smaller))
+  
+  # lapply because the original code was the code in the 'create-cutree-mans' chunk
+  mans <- lapply(list(smaller), function(x){
+    x <- cbind(x, x[, 3])
+    colnames(x) <-c("source", "target", "weight", "length") 
+    x$length <- x$length * 1000
+    x
+  })
+  
+  data.table::fwrite(mans[[1]], 
+                     file = here::here(tsv_path,
+                                       paste0(names(genera_boundaries)[[i]], 
+                                              ".tsv")),
+                     row.names = FALSE,
+                     sep = '\t',
+                     quote = FALSE,
+                     eol = '\r',
+                     scipen = 999)
+}
+```
+
+
+```{r}
+# paths are relative to path within docker
+tsv_path <- paste0('../', tsv_path)
+
+json_path <- file.path("../data/mans/py_mans/json",
+                       conditions)
+dir.create(json_path, recursive = T)
+```
+
+```{r python-layout-all-mans, echo=TRUE}
+com <- paste0('../../miniconda/bin/python3 ../python/idbacnet/main.py ',
+              shQuote(tsv_path, "sh"),
+              " ",
+              shQuote(json_path, "sh"),
+              " ",
+              "json")
+
+if (length(list.files(json_path,full.names = TRUE)) == 7) {
+} else {
+  system(com)
+}
+```
+
+```{r recolor-mans}
+# This could have been done in the python script. But it's not.
+# Read plotly json and change node colors based on source sponge. 
+# Resave as interactive html plot
+# Plotly's 'orca' is non-trivial to get working in docker so...
+# ...to get png, change recolor_mans(png =TRUE)
+
+# Need tsv to find which nodes are samples(source node) and which are m/z (target node)
+man_tsv_paths <- tsv_path
+
+man_tsv_paths <- list.files(man_tsv_paths,
+                            full.names = TRUE)
+
+man_json_paths <- json_path
+
+man_json_paths <- list.files(man_json_paths,
+                             full.names = TRUE)
+message(man_tsv_paths)
+message(man_json_paths)
+
+if (!identical(tools::file_path_sans_ext(basename(man_tsv_paths)),
+               tools::file_path_sans_ext(basename(man_json_paths)))) stop("Must be identical")
+
+
+save_dir <- here::here('manuscript',
+                       'figures',
+                       conditions,
+                       'mans',
+                       "conditons_genera")
+
+if(!dir.exists(save_dir)) dir.create(save_dir, recursive=T)
+
+for (ii in c("sponge_identifier",
+             "dilution",
+             "diversity_plate",
+             "heat_shock",
+             "media")) {
+  zz <- lapply(seq_along(man_tsv_paths), function(i){
+    recolor_mans2(pool = pool,
+                  tsv_path = man_tsv_paths[[i]],
+                  json_path = man_json_paths[[i]],
+                  save_name = tools::file_path_sans_ext(basename(man_tsv_paths[[i]])),
+                  png = FALSE,
+                  dend = NULL,
+                  k = NULL,
+                  meta_column = ii,
+                  display_labels = FALSE)
+  })
+  
+  p <- subplot(zz[[1]],
+               zz[[2]],
+               zz[[3]],
+               zz[[4]],
+               zz[[5]],
+               zz[[6]], nrows = 2) %>% layout(plot_bgcolor='transparent') %>%
+    layout(paper_bgcolor='transparent') %>% config(displayModeBar = F)
+  
+  
+  nam <- paste0(paste0(conditions, collapse = "_"), "_", ii)
+  nam <- file.path(save_dir,
+                   nam)
+  saveRDS(p,
+          file = paste0(nam, ".rds"))
+  
+  htmlwidgets::saveWidget(partial_bundle(p),
+                          file = paste0(nam, ".html"),
+                          selfcontained = T)
+}
+
+```
+
+```{r recolor-mans2}
+# This could have been done in the python script. But it's not.
+# Read plotly json and change node colors based on source sponge. 
+# Resave as interactive html plot
+# Plotly's 'orca' is non-trivial to get working in docker so...
+# ...to get png, change recolor_mans(png =TRUE)
+
+# Need tsv to find which nodes are samples(source node) and which are m/z (target node)
+man_tsv_paths <- list.files(tsv_path,
+                            full.names = TRUE)
+
+man_json_paths <- list.files(json_path,
+                             full.names = TRUE)
+
+if (!identical(tools::file_path_sans_ext(basename(man_tsv_paths)),
+               tools::file_path_sans_ext(basename(man_json_paths)))) stop("Must be identical")
+
+
+save_dir <- here::here('manuscript',
+                       'figures',
+                       conditions,
+                       'mans',
+                       "phylo_genera")
+
+if(!dir.exists(save_dir)) dir.create(save_dir)
+
+zz <- lapply(seq_along(man_tsv_paths), function(i){
+  # dendextend::prune() step with 'k' param is hella-slow
+  recolor_mans2(pool = pool,
+                tsv_path = man_tsv_paths[[i]],
+                json_path = man_json_paths[[i]],
+                save_name = tools::file_path_sans_ext(basename(man_tsv_paths[[i]])),
+                png = FALSE,
+                dend = protein_peak_dend$dendrogram,
+                k = 5,
+                meta_column = NULL,
+                display_labels = FALSE)
+})
+
+p <- subplot(zz[[1]],
+             zz[[2]],
+             zz[[3]],
+             zz[[4]],
+             zz[[5]],
+             zz[[6]], nrows = 2) %>% layout(plot_bgcolor='transparent') %>%
+  layout(paper_bgcolor='transparent') %>% config(displayModeBar = F)
+
+
+nam <- paste0(paste0(conditions, collapse = "_"))
+nam <- file.path(save_dir,
+                 nam)
+# interactive plot
+saveRDS(p,
+        file = paste0(nam, ".rds"))
+
+htmlwidgets::saveWidget(partial_bundle(p),
+                        file = paste0(nam, ".html"),
+                        selfcontained = T)
+
+
+
+```
+
+```{r recolor-man3}
+# This could have been done in the python script. But it's not.
+# Read plotly json and change node colors based on source sponge. 
+# Resave as interactive html plot
+# Plotly's 'orca' is non-trivial to get working in docker so...
+# ...to get png, change recolor_mans(png =TRUE)
+
+# Need tsv to find which nodes are samples(source node) and which are m/z (target node)
+
+man_tsv_paths <- list.files(tsv_path, 
+                            full.names = TRUE)
+
+
+man_json_paths <- list.files(json_path, 
+                             full.names = TRUE)
+
+if (!identical(tools::file_path_sans_ext(basename(man_tsv_paths)),
+               tools::file_path_sans_ext(basename(man_json_paths)))) stop("Must be identical")
+
+save_dir <- here::here('manuscript',
+                       'figures',
+                       conditions,
+                       'mans',
+                       "dend_and_man_phylo_color")
+
+if(!dir.exists(save_dir)) dir.create(save_dir)
+
+for (i in seq_along(man_tsv_paths)) {
+  # dendextend::prune() step with 'k' param is hella-slow
+  z <- recolor_mans_dend(pool = pool,
+                         tsv_path = man_tsv_paths[[i]],
+                         json_path = man_json_paths[[i]],
+                         save_name = tools::file_path_sans_ext(basename(man_tsv_paths[[i]])),
+                         png = FALSE,
+                         dend = protein_peak_dend$dendrogram,
+                         k = 5,
+                         meta_column = NULL,
+                         display_labels = FALSE)
+  
+  nam <- paste0(paste0(conditions, collapse = "_"), "_", i )
+  nam <- file.path(save_dir, 
+                   nam)
+  
+  saveRDS(z, 
+          file = paste0(nam, ".rds"))
+  
+  htmlwidgets::saveWidget(partial_bundle(z),
+                          file = paste0(nam, ".html"),
+                          selfcontained = T)
+  
+  
+}
+
+```
+
+```{r recolor_mans_sponge_dend, eval=FALSE, include=FALSE}
+# This could have been done in the python script. But it's not.
+# Read plotly json and change node colors based on source sponge. 
+# Resave as interactive html plot
+# Plotly's 'orca' is non-trivial to get working in docker so...
+# ...to get png, change recolor_mans(png =TRUE)
+
+# Need tsv to find which nodes are samples(source node) and which are m/z (target node)
+man_tsv_paths <- here::here(tsv_path)
+
+man_tsv_paths <- list.files(man_tsv_paths, 
+                            full.names = TRUE)
+
+man_json_paths <- here::here(json_path)
+
+man_json_paths <- list.files(man_json_paths, 
+                             full.names = TRUE)
+
+if (!identical(tools::file_path_sans_ext(basename(man_tsv_paths)),
+               tools::file_path_sans_ext(basename(man_json_paths)))) stop("Must be identical")
+
+save_dir <- here::here('manuscript',
+                       'figures',
+                       conditions,
+                       'mans',
+                       "dend_and_man_sponge_color")
+
+if(!dir.exists(save_dir)) dir.create(save_dir)
+
+for (i in seq_along(man_tsv_paths)){
+  # dendextend::prune() step with 'k' param is hella-slow
+  z <- recolor_mans_sponge_dend(pool = pool,
+                                tsv_path = man_tsv_paths[[i]],
+                                json_path = man_json_paths[[i]],
+                                save_name = tools::file_path_sans_ext(basename(man_tsv_paths[[i]])),
+                                png = FALSE,
+                                dend = protein_peak_dend$dendrogram,
+                                k = 5,
+                                meta_column = NULL,
+                                display_labels = FALSE)
+  
+  nam <- paste0(paste0(conditions, collapse = "_"),
+                "_", 
+                tools::file_path_sans_ext(basename(man_tsv_paths[[i]])))
+  nam <- file.path(save_dir, 
+                   nam)
+  
+  saveRDS(z, 
+          file = paste0(nam, ".rds"))
+  htmlwidgets::saveWidget(partial_bundle(z),
+                          file = paste0(nam, ".html"),
+                          selfcontained = T)
+  
+  
+}
+
+
+```
+
+```{r bacisiskld, eval=FALSE, include=FALSE}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  # intensity too variabkle across all samples to compare at once
+  labs <- labels(protein_peak_dend$dendrogram)
+  
+  no_chrys <- which(labels(protein_peak_dend$dendrogram) == "443")
+  no_chrys <- labels(protein_peak_dend$dendrogram)[(no_chrys+1):length(labels(protein_peak_dend$dendrogram))]
+  only_chrys <- which(labels(protein_peak_dend$dendrogram) == "443")
+  only_chrys <- labels(protein_peak_dend$dendrogram)[1:only_chrys]
+  
+  
+  prot_dend <- dendextend::prune(protein_peak_dend$dendrogram,  only_chrys)
+  
+  small_data <- lapply(seq_along(no_chrys), function(x){
+    
+    small_data <- IDBacApp::idbac_get_spectra(pool = pool,
+                                              sampleIDs = no_chrys[[x]],
+                                              type = "small",
+                                              MALDIquant = F)
+    
+    
+    return(lapply(small_data, function(x){
+      x[ , mass := as.integer(mass)]
+      x <- x[ , list(intensity = mean(intensity))   , mass]
+      x[mass > 200 ,  , ][mass < 2000 , , ]
+    }))
+    
+  })
+  
+  small_data <- unlist(small_data, recursive = FALSE)
+  small_data <- split(small_data, names(small_data))
+  small_data <- small_data[ match(labels(prot_dend), names(small_data)) ]
+  
+  small_data <- lapply(small_data, function(x){
+    #combine all replicates into one data.table
+    x <- do.call(rbind, x)
+    # mean intensity at unit mass resolution across all replicates
+    x[ , list(intensity = mean(intensity))   , mass]
+  })
+  
+  small_data  <- lapply(seq_along(small_data), function(x) {
+    cbind(small_data[[x]],
+          isolate = x)
+  })
+  
+  small_data <- do.call(rbind, small_data)
+  
+  small_data[ , intensity := sqrt(small_data$intensity), ]
+  
+  pp <- small_data%>%
+    ggplot(
+      aes(mass,
+          as.factor(isolate))) +
+    geom_raster(aes(fill = intensity),
+                interpolate = FALSE)+
+    theme(axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    ylab("Intensity") +
+    xlab("m/z") +
+    theme(axis.text.x = element_text(face = "italic")) +
+    theme(legend.position = "none") +
+    scale_fill_distiller(palette = "Greys",
+                         direction = 1,
+                         #trans = "sqrt",
+                         limits = c(0, 
+                                    2))
+  
+  # loop through and retrieve associations of dendrogram labels and metadata
+  dendrogram_ordered_metadata <- lapply(c("heat_shock", "dilution", "media"),
+                                        function(x){
+                                          met <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                                                              metadataColumn = x,
+                                                                              pool = pool)[, 2]
+                                          
+                                          met2 <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                                                               metadataColumn = "sponge_identifier",
+                                                                               pool = pool)[, 2]
+                                          
+                                          data.table::data.table(n = seq_along(labels(prot_dend)), 
+                                                                 metadata = met,
+                                                                 metadata_id = x,
+                                                                 sponge = met2)
+                                        })
+  
+  # collapse list into one data.table
+  dendrogram_ordered_metadata <- do.call(rbind, dendrogram_ordered_metadata)
+  
+  # Change "no dilution" values to zero without copy on modify
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "ND", metadata := "0" ]
+  
+  # Change dilutions to fraction string
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "100", metadata := "1/100" ]
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "10", metadata := "1/10" ]
+  
+  # Order factors for ggplot
+  ord <- c("FALSE",
+           "TRUE",
+           "0",
+           "1/10",
+           "1/100",
+           "MAC",
+           "ISP1",
+           "LB",
+           "LWA",
+           "ISP2",
+           "A1F",
+           "CGSF",
+           "CHITIN",
+           "NZSGF")
+  
+  # make metadata column a factor for ggplot, with specfied order
+  dendrogram_ordered_metadata[ , metadata := factor(metadata, levels = ord) ]
+  
+  # make facets a factor
+  dendrogram_ordered_metadata[ , metadata_id := factor(metadata_id) ]
+  
+  # Check facet factor levels
+  temp <- levels(dendrogram_ordered_metadata$metadata_id)
+  if(!identical(temp, c("dilution", "heat_shock",  "media"))) stop()
+  
+  # make better strings for facet labels
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "dilution"] <- "Dilution"
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "heat_shock"] <- "Heat Treatment"
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "media"] <- "Media"
+  
+  # setup data frame for creatig separating lines in ggplot
+  factor_plot_lines <- data.frame(yo = c(rep("Dilution", 2),
+                                         rep("Heat Treatment", 1),
+                                         rep("Media", 8)),
+                                  val = c(1:2 + .5,
+                                          1 + .5,
+                                          1:8 + .5))
+  
+  # ggplot dendrogram portion
+  p <- ggtree(ape::as.phylo(prot_dend),
+              ladderize = FALSE)
+  
+  # get 16s genus information
+  genera_16s <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                             metadataColumn = "genus",
+                                             pool = pool)[, 2]
+  
+  # combine 16s genera data with MALDI-TOF reference db matches
+  genera_maldi <- search_result$genus[match(labels(prot_dend),
+                                            search_result$query)]
+  genera_maldi[!is.na(genera_maldi)] <- paste0(genera_maldi[!is.na(genera_maldi)], "*")
+  genera_maldi[is.na(genera_maldi)] <- ""
+  genera <- genera_16s
+  genera[is.na(genera)] <- ""
+  genera <- paste0(genera, genera_maldi)
+  
+  # Add genera labels to plot
+  p <- p +
+    lapply(unique(genera),
+           function(x){ 
+             annotate("text",
+                      x = 5.6, 
+                      y = which(genera == x),
+                      label = x, 
+                      size = 3,
+                      angle = 0, 
+                      fontface = 'italic')
+           }) +
+    coord_cartesian(xlim = c(0, 6.5))
+  
+  
+  # Combine ggplots into final figure
+  p <- p + pp
+  
+  ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                               "qweqwwqe.pdf"),
+         plot = p,
+         device = "pdf",
+         width = 150,
+         height = 200,
+         units = "mm")
+  
+  
+}
+```
+
+```{r eval=FALSE, include=FALSE}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  micromonospora_boundaries <- c(624, 684)
+  micromonospora_ids <- labels(protein_peak_dend$dendrogram)[micromonospora_boundaries[1]:micromonospora_boundaries[2]]
+  not_micro <- labels(protein_peak_dend$dendrogram)[!labels(protein_peak_dend$dendrogram) %in% micromonospora_ids]
+  prot_dend <- dendextend::prune(protein_peak_dend$dendrogram,  not_micro)
+  
+  
+  small_data <- lapply(seq_along(micromonospora_ids), function(x){
+    small_data <- IDBacApp::idbac_get_spectra(pool = pool,
+                                              sampleIDs = micromonospora_ids[[x]],
+                                              type = "small",
+                                              MALDIquant = F)
+    
+    
+    return(lapply(small_data, function(x){
+      x[ , mass := as.integer(mass)]
+      x <- x[ , list(intensity = mean(intensity))   , mass]
+      x[mass > 200 ,  , ][mass < 2000 , , ]
+    }))
+    
+  })
+  
+  small_data <- unlist(small_data, recursive = FALSE)
+  small_data <- split(small_data, names(small_data))
+  small_data <- small_data[ match(labels(prot_dend), names(small_data)) ]
+  
+  small_data <- lapply(small_data, function(x){
+    #combine all replicates into one data.table
+    x <- do.call(rbind, x)
+    # mean intensity at unit mass resolution across all replicates
+    x[ , list(intensity = mean(intensity))   , mass]
+  })
+  
+  small_data  <- lapply(seq_along(small_data), function(x) {
+    cbind(small_data[[x]],
+          isolate = x)
+  })
+  
+  small_data <- do.call(rbind, small_data)
+  
+  
+  
+  # Warning message expected in transform here "In trans$transform(limits) : NaNs produced"
+  # This just lightens th plot, change "limits = c(-2, .5))" below
+  # to "limits = c(0, .5))" to see plot without this warning
+  warning("warning expected, see code for notes")
+  pp <- small_data %>%
+    ggplot(
+      aes(mass,
+          as.factor(isolate))) +
+    geom_raster(aes(fill = intensity),
+                interpolate = FALSE)+
+    theme(axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    ylab("Intensity") +
+    xlab("m/z") +
+    theme(axis.text.x = element_text(face = "italic")) +
+    theme(legend.position = "none") +
+    scale_fill_distiller(palette = "Greys",
+                         direction = 1,
+                         trans = "sqrt",
+                         limits = c(-2, .5))
+  
+  # Dendrogram plotting -----------------------------------------------------
+  
+  dendrogram_ordered_metadata <- lapply(c("heat_shock", "dilution", "media"),
+                                        function(x){
+                                          met <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                                                              metadataColumn = x,
+                                                                              pool = pool)[, 2]
+                                          
+                                          met2 <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                                                               metadataColumn = "sponge_identifier",
+                                                                               pool = pool)[, 2]
+                                          
+                                          data.table::data.table(n = seq_along(labels(prot_dend)),
+                                                                 metadata = met,
+                                                                 metadata_id = x,
+                                                                 sponge = met2)
+                                        })
+  
+  # collapse list into one data.table
+  dendrogram_ordered_metadata <- do.call(rbind, dendrogram_ordered_metadata)
+  
+  # Change "no dilution" values to zero without copy on modify
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "ND", metadata := "0" ]
+  
+  # Change dilutions to fraction string
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "100", metadata := "1/100" ]
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "10", metadata := "1/10" ]
+  
+  # Order factors for ggplot
+  ord <- c("FALSE",
+           "TRUE",
+           "0",
+           "1/10",
+           "1/100",
+           "MAC",
+           "ISP1",
+           "LB",
+           "LWA",
+           "ISP2",
+           "A1F",
+           "CGSF",
+           "CHITIN",
+           "NZSGF")
+  
+  # make metadata column a factor for ggplot, with specfied order
+  dendrogram_ordered_metadata[ , metadata := factor(metadata, levels = ord) ]
+  
+  # make facets a factor
+  dendrogram_ordered_metadata[ , metadata_id := factor(metadata_id) ]
+  
+  # Check facet factor levels
+  temp <- levels(dendrogram_ordered_metadata$metadata_id)
+  if(!identical(temp, c("dilution", "heat_shock",  "media"))) stop()
+  
+  # make better strings for facet labels
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "dilution"] <- "Dilution"
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "heat_shock"] <- "Heat Treatment"
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "media"] <- "Media"
+  
+  # setup data frame for creatig separating lines in ggplot
+  factor_plot_lines <- data.frame(yo = c(rep("Dilution", 2),
+                                         rep("Heat Treatment", 1),
+                                         rep("Media", 8)),
+                                  val = c(1:2 + .5,
+                                          1 + .5,
+                                          1:8 + .5))
+  
+  # ggplot dendrogram portion
+  p <- ggtree(ape::as.phylo(prot_dend),
+              ladderize = FALSE)
+  
+  p <- ggpubr::ggarrange(p, pp, labels = c("a", "b"), align = "h",
+                         font.label = list(size = 16))
+  
+  
+  ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                               "asdasdda.pdf"),
+         plot = p,
+         device = "pdf",
+         width = 175,
+         height = 130,
+         units = "mm")
+  
+}
+```
+
+```{r eval=FALSE, include=FALSE}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  
+  micromonospora_boundaries <- c(721, 816)
+  micromonospora_ids <- labels(protein_peak_dend$dendrogram)[micromonospora_boundaries[1]:micromonospora_boundaries[2]]
+  not_micro <- labels(protein_peak_dend$dendrogram)[!labels(protein_peak_dend$dendrogram) %in% micromonospora_ids]
+  prot_dend <- dendextend::prune(protein_peak_dend$dendrogram,  not_micro)
+  
+  
+  small_data <- lapply(seq_along(micromonospora_ids), function(x){
+    small_data <- IDBacApp::idbac_get_spectra(pool = pool,
+                                              sampleIDs = micromonospora_ids[[x]],
+                                              type = "small",
+                                              MALDIquant = F)
+    
+    
+    return(lapply(small_data, function(x){
+      x[ , mass := as.integer(mass)]
+      x <- x[ , list(intensity = mean(intensity))   , mass]
+      x[mass > 200 ,  , ][mass < 2000 , , ]
+    }))
+    
+  })
+  
+  small_data <- unlist(small_data, recursive = FALSE)
+  small_data <- split(small_data, names(small_data))
+  small_data <- small_data[ match(labels(prot_dend), names(small_data)) ]
+  
+  small_data <- lapply(small_data, function(x){
+    #combine all replicates into one data.table
+    x <- do.call(rbind, x)
+    # mean intensity at unit mass resolution across all replicates
+    x[ , list(intensity = mean(intensity))   , mass]
+  })
+  
+  small_data  <- lapply(seq_along(small_data), function(x) {
+    cbind(small_data[[x]],
+          isolate = x)
+  })
+  
+  small_data <- do.call(rbind, small_data)
+  
+  
+  
+  # Warning message expected in transform here "In trans$transform(limits) : NaNs produced"
+  # This just lightens th plot, change "limits = c(-2, .5))" below
+  # to "limits = c(0, .5))" to see plot without this warning
+  warning("warning expected, see code for notes")
+  pp <- small_data %>%
+    ggplot(
+      aes(mass,
+          as.factor(isolate))) +
+    geom_raster(aes(fill = intensity),
+                interpolate = FALSE)+
+    theme(axis.title.y = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.y = element_blank()) +
+    ylab("Intensity") +
+    xlab("m/z") +
+    theme(axis.text.x = element_text(face = "italic")) +
+    theme(legend.position = "none") +
+    scale_fill_distiller(palette = "Greys",
+                         direction = 1,
+                         trans = "sqrt",
+                         limits = c(-2, .5))
+  
+  # Dendrogram plotting -----------------------------------------------------
+  
+  dendrogram_ordered_metadata <- lapply(c("heat_shock", "dilution", "media"),
+                                        function(x){
+                                          met <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                                                              metadataColumn = x,
+                                                                              pool = pool)[, 2]
+                                          
+                                          met2 <- IDBacApp::idbac_get_metadata(strainID = labels(prot_dend),
+                                                                               metadataColumn = "sponge_identifier",
+                                                                               pool = pool)[, 2]
+                                          
+                                          data.table::data.table(n = seq_along(labels(prot_dend)),
+                                                                 metadata = met,
+                                                                 metadata_id = x,
+                                                                 sponge = met2)
+                                        })
+  
+  # collapse list into one data.table
+  dendrogram_ordered_metadata <- do.call(rbind, dendrogram_ordered_metadata)
+  
+  # Change "no dilution" values to zero without copy on modify
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "ND", metadata := "0" ]
+  
+  # Change dilutions to fraction string
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "100", metadata := "1/100" ]
+  dendrogram_ordered_metadata[metadata_id == "dilution" & metadata == "10", metadata := "1/10" ]
+  
+  # Order factors for ggplot
+  ord <- c("FALSE",
+           "TRUE",
+           "0",
+           "1/10",
+           "1/100",
+           "MAC",
+           "ISP1",
+           "LB",
+           "LWA",
+           "ISP2",
+           "A1F",
+           "CGSF",
+           "CHITIN",
+           "NZSGF")
+  
+  # make metadata column a factor for ggplot, with specfied order
+  dendrogram_ordered_metadata[ , metadata := factor(metadata, levels = ord) ]
+  
+  # make facets a factor
+  dendrogram_ordered_metadata[ , metadata_id := factor(metadata_id) ]
+  
+  # Check facet factor levels
+  temp <- levels(dendrogram_ordered_metadata$metadata_id)
+  if(!identical(temp, c("dilution", "heat_shock",  "media"))) stop()
+  
+  # make better strings for facet labels
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "dilution"] <- "Dilution"
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "heat_shock"] <- "Heat Treatment"
+  levels(dendrogram_ordered_metadata$metadata_id)[levels(dendrogram_ordered_metadata$metadata_id) == "media"] <- "Media"
+  
+  # setup data frame for creatig separating lines in ggplot
+  factor_plot_lines <- data.frame(yo = c(rep("Dilution", 2),
+                                         rep("Heat Treatment", 1),
+                                         rep("Media", 8)),
+                                  val = c(1:2 + .5,
+                                          1 + .5,
+                                          1:8 + .5))
+  
+  # ggplot dendrogram portion
+  p <- ggtree(ape::as.phylo(prot_dend),
+              ladderize = FALSE)
+  
+  p <- ggpubr::ggarrange(p, pp, labels = c("a", "b"), align = "h",
+                         font.label = list(size = 16))
+  
+  
+  ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                               "asdassd22dda.pdf"),
+         plot = p,
+         device = "pdf",
+         width = 175,
+         height = 130,
+         units = "mm")
+}
+```
+
+```{r 16s-vs-mald-id, fig.height=6}
+pdf(file = here::here(paste0("manuscript/figures/", conditions),
+                      "sponge-supp-dbmatches1.pdf"),
+    
+    width = 7.5,
+    height = 5)
+
+par(mfrow=c(2,1), mai = c(.9, .5, .5, .5))
+
+dendextend::set_labels(protein_peak_dend$dendrogram,
+                       search_result$genus[match(labels(protein_peak_dend$dendrogram),
+                                                 search_result$query)]) %>%
+  set("labels_cex", 0.75) %>%
+  plot(ylim=c(-10, 8))
+
+title("MALDI-TOF MS Database Matches", 
+      line = 1)
+
+dendextend::set_labels(protein_peak_dend$dendrogram,
+                       IDBacApp::idbac_get_metadata(strainID =labels(protein_peak_dend$dendrogram),
+                                                    metadataColumn = "genus",
+                                                    pool = pool)[, 2]) %>% 
+  set("labels_cex", 0.75) %>%
+  plot(ylim=c(-10, 8))
+
+
+title("16S rRNA Assignments", line = 1)
+dev.off()
+
+```
+
+```{r 16s-vs-mald-id2, fig.height=6}
+pdf(file = here::here(paste0("manuscript/figures/", conditions),
+                      "sponge-supp-dbmatches2.pdf"),
+    
+    width = 7.5,
+    height = 5)
+
+par(mfrow=c(2,1), mai = c(.9, .5, .5, .5))
+
+dendextend::set_labels(protein_peak_dend$dendrogram,
+                       search_result$genus[match(labels(protein_peak_dend$dendrogram),
+                                                 search_result$query)]) %>%
+  set("labels_cex", 0.75) %>%
+  plot(ylim=c(-10, 8), xlim= c(600,851))
+
+title("MALDI-TOF MS Database Matches", 
+      line = 1)
+
+dendextend::set_labels(protein_peak_dend$dendrogram,
+                       IDBacApp::idbac_get_metadata(strainID =labels(protein_peak_dend$dendrogram),
+                                                    metadataColumn = "genus",
+                                                    pool = pool)[, 2]) %>% 
+  set("labels_cex", 0.75) %>%
+  plot(ylim=c(-10, 8), xlim= c(600,851))
+
+title("16S rRNA Assignments", line = 1)
+dev.off()
+
+```
+
+
+
+
+
+```{r sfig-dendrogram-cut-orthogonal}
+# Retrieve peak data
+ortho_protein_peak_data <- IDBacApp::idbac_get_peaks(pool = pool,
+                                                     sampleIDs = NULL,
+                                                     minFrequency = 0.7,
+                                                     minNumber = 1,
+                                                     lowerMassCutoff = 4000L,
+                                                     upperMassCutoff = 15000L,
+                                                     minSNR = 6,
+                                                     tolerance = 2,
+                                                     type = "protein",
+                                                     mergeReplicates = TRUE,
+                                                     method = "strict")
+
+# Represent peaks as probability distributions on higher dimensional vector (alternative to binning)
+ortho_protein_peak_matrix <- IDBacApp::mquant_bin(massStart = 4000,
+                                                  massEnd = 15000,
+                                                  massList = lapply(ortho_protein_peak_data, function(x) x@mass),
+                                                  intensityList = lapply(ortho_protein_peak_data, function(x) x@intensity),
+                                                  method = 'strict',
+                                                  tolerance = 2)
+
+ortho_protein_peak_dend <- IDBacApp::idbac_dendrogram_creator(bootstraps = 0L,
+                                                              distanceMethod = 'euclidean',
+                                                              clusteringMethod = 'ward.D2',
+                                                              proteinMatrix = ortho_protein_peak_matrix)
+
+
+sample_meta <- IDBacApp::idbac_get_metadata(strainID = labels(ortho_protein_peak_dend$dendrogram),
+                                            metadataColumn = "sponge_identifier",
+                                            pool = pool)
+sample_meta <- as.data.table(sample_meta)
+
+seq_cuts <- seq(from = 0,
+                to = 1942,
+                by = 50)
+
+break_interval <- 49
+
+# Analyze group content by cutting protein spectra dendrogram at all 'seq_cuts'
+cont <- lapply(seq_cuts, 
+               function(x) {
+                 # cut dendrogram
+                 # This creates a named integer vector, names are dendrogram labels
+                 # integers represent the created groups
+                 z <- cutree(ortho_protein_peak_dend$dendrogram, h = x)
+                 
+                 # change names to which sponge an isolate came from
+                 names(z) <- sample_meta[match(names(z), strain_id)]$sponge_identifier
+                 
+                 # turn named int vector into list, where elements are groups created by cutree()
+                 z <- split(names(z), as.numeric(z))
+                 
+                 # loop over groups
+                 z <- lapply(seq_along(z),  
+                             function(x){
+                               
+                               if(length(z[[x]]) > 1) {
+                                 # If more than one orgin sponge, combine into length=1 char vector
+                                 y <- paste0(sort(unique(z[[x]])), collapse = ", ")
+                               } else {
+                                 # If only one sponge, return it as length=1 char vector
+                                 y <- z[[x]]
+                               }
+                               # create a data table from the results
+                               data.table::data.table(group = x, 
+                                                      contents = y, 
+                                                      members = length(z[[x]]),
+                                                      stringsAsFactors = F)
+                             })
+                 # combine data tables for all groups
+                 z <- do.call(rbind, z)
+                 # add the cut height to the table
+                 cbind(cut_height = x, z)
+               })
+
+# combine all cut analyses
+cont <- do.call(rbind, cont)
+
+# convert group content to factor for ggplot
+cont$contents <- factor(cont$contents,
+                        levels = c(
+                          "SCD18",
+                          "SCD21",
+                          "SCD18, SCD21"))
+
+# create group fraction analysis plot
+idbacfuzzifier_plot <- ggplot() + 
+  geom_bar(data = cont[cut_height %in% seq_cuts, ], 
+           aes(
+             x = cut_height,
+             fill = contents),
+           position="fill", 
+           stat="count",
+           width = break_interval) +
+  labs(fill = "Source Sponge",
+       x = "Dendrogram Cut Height",
+       y = "Fraction of Groups",
+       title  =  "") + 
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values=c("#1b9e77",
+                             "#7570b3",
+                             "#d95f02")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        strip.background.x = element_rect(color = NA,
+                                          fill = NA))
+
+
+# count how many isolates at each cut belong to a group...
+# that contains isolates from one sponge, the other sponge, or both
+temp <- cont[, list(SCD18 = sum(.SD[contents == "SCD18"]$members),
+                    SCD21 = sum(.SD[contents == "SCD21"]$members),
+                    Both = sum(.SD[contents == "SCD18, SCD21"]$members)), 
+             cut_height]
+
+temp <- melt(temp, 
+             id.vars="cut_height",
+             measure.vars = c("SCD18",
+                              "SCD21", 
+                              "Both"))
+# remove 0's to prevent confusing overplotting 
+# doesn't effect interpretation of plot
+temp <- temp[value > 0, ]
+
+idbacfuzzifier_plot2 <- ggplot(temp) + 
+  geom_point(aes(x = cut_height,
+                 y = value,
+                 color = variable),
+             alpha = 0.7) +
+  scale_color_manual(name = "Source Sponge",
+                     values = c("#1b9e77",
+                                "#7570b3",
+                                "#d95f02")) +
+  cowplot::theme_cowplot(font_size = 10) +
+  labs(y= "Isolate Count", x = "Dendrogram Cut Height") 
+
+
+# plot flipped dendrogram with example cut
+dend <- ggdendro::ggdendrogram(ortho_protein_peak_dend$dendrogram, 
+                               rotate = TRUE, 
+                               leaf_labels = F,
+                               labels = FALSE) + 
+  theme(axis.text.y = element_blank(),
+        axis.text.x = element_text(hjust = 0.5, 
+                                   vjust = 5)) + 
+  scale_y_continuous(limits = c(0, 1945), 
+                     breaks = seq(0, 2000, 750)) 
+
+
+# combine plots into final figure
+p <- ggpubr::ggarrange(dend, 
+                       ggpubr::ggarrange(idbacfuzzifier_plot +
+                                           theme(legend.position = "none",
+                                                 axis.title.x = element_blank()),
+                                         idbacfuzzifier_plot2 + 
+                                           theme(legend.position = c(0.7, 0.5)),
+                                         ncol = 1,
+                                         nrow = 2,
+                                         common.legend = FALSE,
+                                         labels= c("b", "c")),
+                       ncol = 2,
+                       widths = c(1, 2), 
+                       labels = c("a", ""))
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-supp-altclust.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+
+
+remove(
+  "ortho_protein_peak_data",
+  "ortho_protein_peak_matrix",
+  "ortho_protein_peak_dend",
+  "break_interval",
+  "cont",
+  "dend",
+  "idbacfuzzifier_plot",
+  "idbacfuzzifier_plot2",
+  "sample_meta",
+  "seq_cuts",
+  "temp"
+)
+```
+
+
+```{r supp-fig-taxonomy-tree}
+#A common taxonomy tree was created on 2020/05/11 at www.ncbi.nlm.nih.gov/Taxonomy
+b <- ape::read.tree(here::here("data/tree/taxonomy.phy"))
+p <- ggtree::ggtree(b, alpha = .5) + 
+  ggtree::geom_nodelab(nudge_y = .2, size = 2.3) + 
+  ggtree::geom_tiplab(size = 3) +  
+  ggplot2::xlim(0, 25)
+
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-taxtree.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+
+
+```
+
+```{r k-means}
+# this is a completely un-optimized memory hungry monster when run in parallel, so we'll clear all ram here:
+seq_cuts <- 1:200
+broke <- 1
+
+n_cor <- parallel::detectCores()
+ncor <- ifelse(n_cor > 1, n_cor - 1, 1)
+
+cont <- parallel::mclapply(seq_cuts, 
+                           function(x) {
+                             z <- kmeans(protein_peak_dend$distance, x)$cluster
+                             names(z) <- IDBacApp::idbac_get_metadata(strainID = names(z),
+                                                                      metadataColumn = "sponge_identifier",
+                                                                      pool = pool)$sponge_identifier
+                             
+                             z <- split(names(z), as.numeric(z))
+                             
+                             z <- lapply(seq_along(z),  
+                                         function(x){
+                                           
+                                           if(length(z[[x]]) > 1) {
+                                             y <- paste0(sort(unique(z[[x]])), collapse = ", ")
+                                           } else {
+                                             y <- z[[x]]
+                                           }
+                                           cbind.data.frame(group = x, 
+                                                            contents = y, 
+                                                            mems = length(z[[x]]),
+                                                            stringsAsFactors = F)
+                                         })
+                             z <- do.call(rbind, z)
+                             cbind.data.frame(cut_height = x, z)
+                           }, mc.cores = n_cor)
+
+cont <- do.call(rbind, cont)
+cont <- data.table::as.data.table(cont)
+
+cont$contents <- factor(cont$contents,
+                        levels = c(
+                          "SCD18",
+                          "SCD21",
+                          "SCD18, SCD21"))
+
+```
+
+```{r plotkmeans}
+
+idbacfuzzifier_plot <- ggplot() + 
+  geom_bar(data = cont[cut_height %in% seq_cuts, ], 
+           aes(
+             x = cut_height,
+             fill = contents),
+           position="fill", 
+           stat="count",
+           width = broke) +
+  labs(fill = "Source Sponge",
+       x = "Dendrogram Cut Height",
+       y = "Fraction of Groups",
+       title  =  "") + 
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_y_continuous(expand = c(0, 0)) +
+  scale_fill_manual(values=c("#1b9e77",
+                             "#7570b3",
+                             "#d95f02")) +
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        strip.background.x = element_rect(color = NA,
+                                          fill = NA)) +
+  coord_cartesian(xlim = c(200, 0))
+
+
+
+temp <- cont[, list(SCD18=sum(.SD[contents == "SCD18"]$mems),
+                    SCD21=sum(.SD[contents == "SCD21"]$mems),
+                    Both=sum(.SD[contents == "SCD18, SCD21"]$mems)), cut_height]
+
+temp <- melt(temp, id.vars="cut_height", measure.vars = c("SCD18", "SCD21", "Both"))
+temp <- temp[value > 0, ]
+
+idbacfuzzifier_plot2 <- ggplot(temp) + 
+  geom_point(aes(x = cut_height,
+                 y = value,
+                 color = variable),
+             alpha = 0.7) +
+  scale_color_manual(name = "Source Sponge",
+                     values = c("#1b9e77",
+                                "#7570b3",
+                                "#d95f02")) +
+  cowplot::theme_cowplot(font_size = 10) +
+  labs(y= "Isolate Count", x = "k-means Centers") +
+  coord_cartesian(xlim = c(200, 0))
+
+
+
+p <- ggpubr::ggarrange(idbacfuzzifier_plot +
+                         theme(legend.position = "none",
+                               axis.title.x = element_blank()),
+                       idbacfuzzifier_plot2, 
+                       
+                       ncol = 1,
+                       nrow = 2,
+                       legend = "bottom",
+                       common.legend = TRUE,
+                       labels= c("a", "b"))
+
+
+
+ggsave(filename = here::here(paste0("manuscript/figures/", conditions),
+                             "sponge-supp-kmeans.pdf"),
+       plot = p,
+       device = "pdf",
+       width = 175,
+       height = 130,
+       units = "mm")
+```
+
+
+```{r beta-div-no-chrys, fig.height=3}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  
+  # Get dendrogram positions of Chryseobacterium and Delftia isolates
+  only_chrys <- which(labels(protein_peak_dend$dendrogram) == "443")
+  only_chrys <- labels(protein_peak_dend$dendrogram)[1:only_chrys]
+  no_chrys <- which(labels(protein_peak_dend$dendrogram) == "443")
+  no_chrys <- labels(protein_peak_dend$dendrogram)[(no_chrys+1):length(labels(protein_peak_dend$dendrogram))]
+  
+  # convert distance matrix into regular matrix
+  p_dist_temp <- protein_peak_dend$distance
+  p_dist_temp <- as.matrix(p_dist_temp)
+  
+  # Get all metadata from the database
+  meta <- dplyr::tbl(pool, "metadata") %>% collect
+  meta <- as.data.table(meta)
+  
+  # Calculate PCoA 
+  
+  p1 <- b_div(meta = meta[match(colnames(protein_peak_dend$distance), meta$strain_id), ],
+              meta_names = c("sponge_identifier",
+                             "dilution",
+                             "heat_shock",
+                             "media"),
+              p_dist_temp = as.dist(
+                protein_peak_dend$distance
+              ))
+  
+  
+  p2 <- b_div(meta = meta[match(only_chrys, meta$strain_id), ],
+              meta_names = c("sponge_identifier",
+                             "dilution",
+                             "heat_shock",
+                             "media"),
+              p_dist_temp = as.dist(
+                p_dist_temp[match(only_chrys, colnames(p_dist_temp)),
+                            match(only_chrys, colnames(p_dist_temp))]
+              ))
+  
+  p3 <- b_div(meta = meta[match(no_chrys, meta$strain_id), ],
+              meta_names = c("sponge_identifier",
+                             "dilution",
+                             "heat_shock",
+                             "media"),
+              p_dist_temp = as.dist(
+                p_dist_temp[match(no_chrys, colnames(p_dist_temp)),
+                            match(no_chrys, colnames(p_dist_temp))]
+              ))
+  
+  
+}
+```
+
+```{r beta-div-plot-all}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  par(mar = c(2, 2, 2, 0.5), 
+      mfrow = c(2,2),
+      oma = c(2, 2, 2, 1))
+  plot(p1[[1]], main = "Origin Sponge")
+  plot(p1[[2]], main = "Dilution")
+  plot(p1[[3]], main = "Heat Treatment")
+  plot(p1[[4]], main = "Isolation Media")
+  mtext("PCoA: All Isolates", 
+        outer = TRUE,
+        cex = 1.2)
+}
+```
+
+```{r beta-div-plot-only-delftia-chrys}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  par(mar = c(2, 2, 2, 0.5),
+      mfrow = c(2, 2),
+      oma = c(2, 2, 2, 1))
+  plot(p2[[1]], main = "Origin Sponge")
+  plot(p2[[2]], main = "Dilution")
+  plot(p2[[3]], main = "Heat Treatment")
+  plot(p2[[4]], main = "Isolation Media")
+  mtext(substitute(paste("PCoA: ", 
+                         italic("Chryseobacterium"),
+                         " and ",
+                         italic("Delftia"), 
+                         " Groups Only")), 
+        outer = TRUE,
+        cex = 1.2)
+}
+```
+
+```{r beta-div-plot-no-delftia-chrys}
+# only run if it's the full dataset
+if(length(labels(protein_peak_dend$dendrogram)) == 851) {
+  par(mar = c(2, 2, 2, 0.5),
+      mfrow = c(2, 2),
+      oma = c(2, 2, 2, 1))
+  plot(p3[[1]], main = "Origin Sponge")
+  plot(p3[[2]], main = "Dilution")
+  plot(p3[[3]], main = "Heat Treatment")
+  plot(p3[[4]], main = "Isolation Media")
+  mtext(substitute(paste("PCoA: ", 
+                         italic("Chryseobacterium"),
+                         " and ",
+                         italic("Delftia"), 
+                         " Groups Removed")), 
+        outer = TRUE,
+        cex = 1.2)
+}
+```
+
+```{r, pie-all, message=FALSE, warning=FALSE}
+a <- lapply(seq_along(genera_boundaries), function(i){
+  
+  smaller <- names(small_peak_data)
+  
+  ids <- labels(protein_peak_dend$dendrogram)[genera_boundaries[[i]][1]:genera_boundaries[[i]][2]]
+  
+  smaller <- small_peak_data[match(ids, smaller)]
+  
+  smaller <- MALDIquant::binPeaks(l = smaller,
+                                  method = 'strict', 
+                                  tolerance = .002)
+  
+  smaller <- IDBacApp:::small_maldiquant_to_network(peakList = smaller,
+                                                    sampleIDs = labels(smaller))
+  
+  
+  
+  colnames(smaller) <-c("source", "target", "weight") 
+  smaller <- as.data.table(smaller)
+  cbind(smaller, i = names(genera_boundaries)[[i]])
+  
+})
+a <- do.call(rbind, a)
+
+
+shared <- a[ , length(source), list(i, target)][, list(unshared = sum(V1 == 1), 
+                                                       shared = length(V1)) , i]
+n_isol <- a[ , length(unique(source)), i]
+tab <- merge(shared, n_isol, by = "i")
+mean_norm <- a[, length(unique(target)) , list(source, i)][ , round(mean(V1), 0) , i] 
+tab <- merge(tab, mean_norm)
+colnames(tab) <- c("Genus",
+                   "One Isolate",
+                   "Multiple Isolates",
+                   "Isolates in group",
+                   "Mean features per isolate")
+tab
+```
+
+
+```{r}
+
+pseudomonas <- data.frame(
+  "genbank_accession" = c(
+    "MT596543",
+    "MT596542",
+    "MT596541",
+    "MT596545"
+  ),
+  "analysis_id" = c(
+    "207",
+    "158",
+    "129",
+    "414"
+  ))
+
+seqd <- sapply(pseudomonas$analysis_id,
+               function(x){
+                 grep(x, labels(protein_peak_dend$dendrogram))
+                },
+               USE.NAMES = F
+               )
+names(seqd) <- pseudomonas$genbank_accession
+
+
+
+temp_dend <- protein_peak_dend$dendrogram
+
+labels(temp_dend) = rep("", length(labels(temp_dend)))
+
+labels(temp_dend)[seqd] <- names(seqd)
+
+
+
+plot(temp_dend, xlim=c(545,630), main = substitute(paste(italic('Pseudomonas'), " 16S rRNA Accessions")))
+lines(c(550.5,550.5), y = c(0, 8), type = "l", col = "blue", lwd = 3)
+lines(c(623.5,623.5), y = c(0, 8), type = "l", col = "blue", lwd = 3)
+
+
+
+
+#########################################
+
+
+
+
+chryseobacterium <- data.frame(
+  "genbank_accession" = c(
+    "MT596558",
+    "MT596556",
+    "MT596550",
+    "MT596549"
+  ),
+  "analysis_id" = c(
+    "795",
+    "693",
+    "546",
+    "534"
+  ))
+
+seqd <- sapply(chryseobacterium$analysis_id,
+               function(x){
+                 grep(x, labels(protein_peak_dend$dendrogram))
+               },
+               USE.NAMES = F
+)
+names(seqd) <- chryseobacterium$genbank_accession
+
+
+
+temp_dend <- protein_peak_dend$dendrogram
+
+labels(temp_dend) = rep("", length(labels(temp_dend)))
+
+labels(temp_dend)[seqd] <- names(seqd)
+
+
+
+plot(temp_dend, xlim=c(0,250), main = substitute(paste(italic('Chryseobacterium'), " 16S rRNA Accessions")))
+lines(c(0.5,0.5), y = c(0, 8), type = "l", col = "blue", lwd = 3)
+lines(c(220.5,220.5), y = c(0, 8), type = "l", col = "blue", lwd = 3)
+
+
+bob_the_two_plot_builder(pool = pool, input_a ="586", input_b = "779", protein_dist = protein_peak_dend$distance, dend = protein_peak_dend$dendrogram)
+
+```
+
+

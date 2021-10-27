@@ -1,0 +1,67 @@
+--- 
+title: "Assessing phylogenetic and specialized metabolite variation within the *E. fragilis* culturable microbiome with MALDI-TOF MS and IDBac"
+author: ""
+output: 
+  html_document:
+      self_contained: no
+---
+
+This document contains the code to make the 16S-rRNA plots
+
+SILVA aligner and tree results can be found in:
+
+
+```{r}
+library(phytools)
+library(ape)
+library(ggtree)
+library(ggplot2)
+```
+
+
+```{r}
+here::here("data/16s")
+```
+Results for SILVA (and screenshot of selected parameters), run with all sponge 16S-rRNA sequences can be found here:
+```{r}
+here::here("data/16s/all")
+```
+And corresponding nearest neighbor strains can be found here:
+```{r}
+here::here("data/16s/silva_neighbors")
+```
+
+Read SILVA newick tree, find genus/species of reference strains to add to tip label, and save plot
+```{r}
+arb_newick <-ape::read.tree(here::here("data/16s/silva_all/arbsilva.nwk"))
+arb_newick <- phytools::midpoint.root(arb_newick)
+neighbors <- ape::read.FASTA(here::here("data/16s/silva_neighbors/arb-silva.de_2020-07-17_id856269_tax_silva.fasta"))
+neighbors <- labels(neighbors)
+
+neighbors_acc <- sapply(strsplit(neighbors, " "), function(x) x[[1]])
+neighbors_genus <- sapply(strsplit(neighbors, " "), function(x) x[[2]])
+neighbors_genus <- sapply(strsplit(neighbors_genus, ";"), function(x) tail(x, 1))
+neighbors_species <- sapply(strsplit(neighbors, " "), function(x) x[[3]])
+neighbors_species <- sapply(strsplit(neighbors_species, ";"), function(x) tail(x, 1))
+
+neighbors <- paste0(neighbors_genus, " ", neighbors_species)
+
+
+neighbors <- neighbors[match(arb_newick$tip.label, neighbors_acc)]
+neighbors[is.na(neighbors)] <- ""
+
+arb_newick$tip.label <- paste0(arb_newick$tip.label, "_", neighbors)
+
+
+p<-ggtree::ggtree(arb_newick) + geom_treescale() +  coord_cartesian(clip = 'off') + theme_tree2(plot.margin=margin(6, 200, 6, 6))
+p %<+% data.frame(seq = arb_newick$tip.label, cat = grepl("sponge", arb_newick$tip.label)) + 
+    geom_tiplab(aes(color = factor(cat)),
+                geom = "text",  # labels not text
+                size = 3) + 
+    scale_color_manual(values = c("black", "red")) + 
+    theme(legend.position = "none") ->p
+
+
+ggsave(here::here("manuscript/figures/16s_tree.pdf"), plot = p, height = 11, width = 7, units = "in")
+```
+

@@ -1,0 +1,56 @@
+FROM rocker/rstudio:3.6.3
+# Not minimal R b/c pandoc, etc needed
+
+# System packages
+RUN apt-get update -qq && apt-get -y --no-install-recommends install \
+libxml2-dev \
+libcairo2-dev \
+libsqlite-dev \
+libpq-dev \
+libicu-dev \
+libbz2-dev \
+liblzma-dev \
+libfontconfig1-dev \
+libssl-dev \
+libcurl4-openssl-dev \
+libnetcdf-dev \
+udunits-bin \
+libudunits2-dev \
+curl
+
+# Install miniconda to /miniconda
+RUN curl -LO https://repo.anaconda.com/miniconda/Miniconda3-py37_4.8.2-Linux-x86_64.sh
+RUN bash Miniconda3-py37_4.8.2-Linux-x86_64.sh -p /miniconda -b
+RUN rm Miniconda3-py37_4.8.2-Linux-x86_64.sh
+ENV PATH=/miniconda/bin:${PATH}
+RUN conda update -y conda
+
+# Python packages
+
+RUN conda config --add channels conda-forge && \
+    conda config --add channels bioconda && \
+    conda config --add channels default
+
+RUN conda install networkx=2.4 && \
+    conda install pandas=1.0.3 && \
+    conda install plotly=4.5.4 && \
+    conda install -c conda-forge matplotlib=3.4.1
+
+RUN apt-get update && \
+    apt-get install gcc -y && \
+    pip install fa2==0.3.5
+
+
+# R packages
+RUN echo 'options("repos"="https://mran.microsoft.com/snapshot/2021-03-23")' >> /usr/local/lib/R/etc/Rprofile.site
+RUN Rscript -e 'install.packages("remotes")'
+RUN Rscript -e 'remotes::install_github("chasemc/IDBacApp@8e659ad04debb209114452c0c463c7f02df3f264", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'remotes::install_github("YuLab-SMU/ggtree@0681b23", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'remotes::install_github("kassambara/ggpubr@ac5a01f", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("ggbeeswarm", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("here", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("GGally", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("vegan", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("ggdendro", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("dbplyr", Ncpus=parallel::detectCores())'
+RUN Rscript -e 'install.packages("phytools", Ncpus=parallel::detectCores())'

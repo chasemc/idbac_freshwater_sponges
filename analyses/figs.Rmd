@@ -1,0 +1,36 @@
+
+Orca is 
+
+
+```{r}
+a <- here::here("manuscript/figures/matched/mans")
+b <- list.files(a, full.names = TRUE, pattern = "^.*\\.(rds)$", recursive = T)
+
+setwd(here::here())
+
+for (i in seq_along(b)) {
+  
+  iter_dir <- dirname(gsub(here::here(), "", b[[i]]))
+  iter_name <- basename(b[[i]])
+  iter_name <- tools::file_path_sans_ext(iter_name)
+  
+  # read plotly plot
+  man <- readRDS(b[[i]])
+  
+
+out_name <- file.path(iter_dir, 
+                      paste0(iter_name, ".pdf"))
+
+  tryCatch(plotly::orca(p = man,
+     file = out_name,
+     format = "pdf",
+     scale = 1,
+     width = 900, 
+     height = 600, 
+     more_args = "--disable-gpu"), error = function(e) "")
+
+ 
+}
+  
+```
+  
