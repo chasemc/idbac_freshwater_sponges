@@ -31,10 +31,7 @@ RUN conda config --add channels conda-forge && \
     conda config --add channels bioconda && \
     conda config --add channels default
 
-RUN conda install networkx=2.4 && \
-    conda install pandas=1.0.3 && \
-    conda install plotly=4.5.4 && \
-    conda install -c conda-forge matplotlib=3.4.1
+RUN conda install -c conda-forge networkx=2.4 pandas=1.0.3 plotly=4.5.4 matplotlib=3.4.1
 
 RUN apt-get update && \
     apt-get install gcc -y && \

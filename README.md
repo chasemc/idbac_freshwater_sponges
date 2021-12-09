@@ -23,3 +23,20 @@ docker run --user `id -u` --rm -ti -v${PWD}:/top -w/top/analyses chasemc2/sponge
 docker run --user `id -u` --rm -ti -v${PWD}:/top -w/top/analyses chasemc2/sponge_manuscript Rscript -e 'rmarkdown::render("analysis.Rmd", params = list(conditions = "matched"),  output_file = "matched_isolates.html")' 
 docker run --user `id -u` --rm -ti -v${PWD}:/top -w/top/analyses chasemc2/sponge_manuscript Rscript -e 'rmarkdown::render("16s_analysis.Rmd")' 
 ```
+
+
+PDF images were converted to PNG with Inkscape 
+
+e.g.
+```
+
+for i in *.pdf; do
+    inkscape --export-background-opacity=0 --export-dpi=300 --export-type="$i"
+done
+
+
+
+```
+
+
+
